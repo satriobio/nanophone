@@ -21,7 +21,7 @@
       }
       video#video {
         display: none;
-      } /* keep video hidden but available for capture */
+      } /* hidden video source */
     </style>
   </head>
   <body class="container py-4">
@@ -75,7 +75,7 @@
       </div>
     </div>
 
-    <!-- Embedded lookup table -->
+    <!-- Lookup table -->
     <script id="lookupData" type="text/plain">
       AAA	10
       AAC	20
@@ -146,7 +146,7 @@
     <script>
       const BOX_SIZE = 40,
         SAMPLES_PER_BLOCK = 30;
-      const SETTLE_MS = 2000; // require 2s stable detection
+      const SETTLE_MS = 2000; // ms stable before capture
 
       const colorToBase = { red: "A", blue: "C", yellow: "T", green: "G" };
       const baseToCode = { A: "R", C: "B", T: "Y", G: "G" };
@@ -387,7 +387,18 @@
         requestAnimationFrame(process);
       }
 
+      // --- Camera selection ---
       async function populateCameras() {
+        try {
+          // Request temp stream to unlock labels
+          let tempStream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+          });
+          tempStream.getTracks().forEach((track) => track.stop());
+        } catch (e) {
+          console.warn("Temp stream failed", e);
+        }
+
         let devices = await navigator.mediaDevices.enumerateDevices();
         let videoDevices = devices.filter((d) => d.kind === "videoinput");
         let sel = document.getElementById("cameraSelect");
@@ -399,13 +410,28 @@
           sel.appendChild(opt);
         });
       }
+
       async function startCamera() {
         let deviceId = document.getElementById("cameraSelect").value;
-        let stream = await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: deviceId ? { exact: deviceId } : undefined },
-        });
-        document.getElementById("video").srcObject = stream;
-        process();
+        let constraints;
+        if (deviceId) {
+          constraints = { video: { deviceId: { exact: deviceId } } };
+        } else {
+          constraints = { video: { facingMode: { ideal: "environment" } } };
+        }
+
+        try {
+          let stream = await navigator.mediaDevices.getUserMedia(constraints);
+          document.getElementById("video").srcObject = stream;
+          process();
+        } catch (err) {
+          console.warn("Camera error, retrying with default", err);
+          let stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+          });
+          document.getElementById("video").srcObject = stream;
+          process();
+        }
       }
 
       loadLookupEmbedded();
