@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Nanopore Emulator (Pure JS)</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+    <style>
+      body {
+        background: #111;
+        color: #eee;
+      }
+      canvas {
+        border: 1px solid #444;
+        border-radius: 8px;
+      }
+      .status {
+        font-weight: bold;
+      }
+      video#video {
+        display: none;
+      } /* keep video hidden but available for capture */
+    </style>
+  </head>
+  <body class="container py-4">
+    <h2 class="mb-4 text-info">Nanopore Emulator (3-sensor, Pure JS)</h2>
+
+    <!-- Controls -->
+    <div class="card bg-dark text-light mb-3">
+      <div class="card-body d-flex align-items-center gap-3">
+        <label for="cameraSelect" class="form-label m-0">Camera:</label>
+        <select id="cameraSelect" class="form-select w-auto"></select>
+        <button id="startBtn" class="btn btn-primary">Start</button>
+        <span id="status" class="status text-warning"
+          >⏳ Waiting for camera...</span
+        >
+      </div>
+    </div>
+
+    <!-- Hidden video source -->
+    <video id="video" autoplay playsinline></video>
+
+    <!-- Processed output -->
+    <div class="card bg-dark text-light mb-3">
+      <div class="card-body text-center">
+        <canvas id="canvas" width="480" height="360"></canvas>
+      </div>
+    </div>
+
+    <!-- Logs + Plots -->
+    <div class="row">
+      <div class="col-md-6">
+        <div class="card bg-dark text-light mb-3">
+          <div class="card-header">Live Bases</div>
+          <div class="card-body"><pre id="liveBases">---</pre></div>
+        </div>
+        <div class="card bg-dark text-light mb-3">
+          <div class="card-header">Log</div>
+          <div class="card-body">
+            <pre id="log">⏳ Waiting for camera...</pre>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-6">
+        <div class="card bg-dark text-light mb-3">
+          <div class="card-header">Voltage Signal</div>
+          <div class="card-body"><canvas id="plot" height="200"></canvas></div>
+        </div>
+        <div class="card bg-dark text-light mb-3">
+          <div class="card-header">Reconstructed Sequence</div>
+          <div class="card-body"><pre id="sequence"></pre></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Embedded lookup table -->
+    <script id="lookupData" type="text/plain">
+      AAA	10
+      AAC	20
+      AAT	30
+      AAG	40
+      ACA	50
+      ACC	60
+      ACT	70
+      ACG	80
+      ATA	90
+      ATC	100
+      ATT	110
+      ATG	120
+      AGA	130
+      AGC	140
+      AGT	150
+      AGG	160
+      CAA	170
+      CAC	180
+      CAT	190
+      CAG	200
+      CCA	210
+      CCC	220
+      CCT	230
+      CCG	240
+      CTA	250
+      CTC	260
+      CTT	270
+      CTG	280
+      CGA	290
+      CGC	300
+      CGT	310
+      CGG	320
+      TAA	330
+      TAC	340
+      TAT	350
+      TAG	360
+      TCA	370
+      TCC	380
+      TCT	390
+      TCG	400
+      TTA	410
+      TTC	420
+      TTT	430
+      TTG	440
+      TGA	450
+      TGC	460
+      TGT	470
+      TGG	480
+      GAA	490
+      GAC	500
+      GAT	510
+      GAG	520
+      GCA	530
+      GCC	540
+      GCT	550
+      GCG	560
+      GTA	570
+      GTC	580
+      GTT	590
+      GTG	600
+      GGA	610
+      GGC	620
+      GGT	630
+      GGG	640
+    </script>
+
+    <script>
+      const BOX_SIZE = 40,
+        SAMPLES_PER_BLOCK = 30;
+      const SETTLE_MS = 2000; // require 2s stable detection
+
+      const colorToBase = { red: "A", blue: "C", yellow: "T", green: "G" };
+      const baseToCode = { A: "R", C: "B", T: "Y", G: "G" };
+      const colorRanges = {
+        red: [
+          [0, 120, 70],
+          [10, 255, 255],
+        ],
+        green: [
+          [40, 40, 40],
+          [70, 255, 255],
+        ],
+        blue: [
+          [100, 150, 0],
+          [140, 255, 255],
+        ],
+        yellow: [
+          [20, 100, 100],
+          [30, 255, 255],
+        ],
+        black: [
+          [0, 0, 0],
+          [180, 255, 50],
+        ],
+      };
+
+      let kmerDict = {},
+        valToKmer = {};
+      function loadLookupEmbedded() {
+        let txt = document.getElementById("lookupData").textContent.trim();
+        txt.split("\n").forEach((line) => {
+          let [k, v] = line.split("\t");
+          kmerDict[k] = +v;
+          valToKmer[+v] = k;
+        });
+      }
+
+      let recording = false,
+        systemReady = false;
+      let lastDetected = null,
+        stableSince = null,
+        kmers = [],
+        voltages = [];
+
+      function rgb2hsv(r, g, b) {
+        r /= 255;
+        g /= 255;
+        b /= 255;
+        let max = Math.max(r, g, b),
+          min = Math.min(r, g, b),
+          d = max - min;
+        let h = 0,
+          s = max === 0 ? 0 : d / max,
+          v = max;
+        if (d !== 0) {
+          if (max === r) h = ((g - b) / d) % 6;
+          else if (max === g) h = (b - r) / d + 2;
+          else h = (r - g) / d + 4;
+          h *= 60;
+          if (h < 0) h += 360;
+        }
+        return [h / 2, s * 255, v * 255];
+      }
+      function inRange(hsv, lower, upper) {
+        return (
+          hsv[0] >= lower[0] &&
+          hsv[0] <= upper[0] &&
+          hsv[1] >= lower[1] &&
+          hsv[1] <= upper[1] &&
+          hsv[2] >= lower[2] &&
+          hsv[2] <= upper[2]
+        );
+      }
+      function detectColor(pixels, w, h, x1, y1) {
+        let counts = {};
+        for (let y = y1; y < y1 + BOX_SIZE; y++) {
+          for (let x = x1; x < x1 + BOX_SIZE; x++) {
+            let idx = (y * w + x) * 4;
+            let r = pixels[idx],
+              g = pixels[idx + 1],
+              b = pixels[idx + 2];
+            let hsv = rgb2hsv(r, g, b);
+            for (let [color, [lo, hi]] of Object.entries(colorRanges)) {
+              if (inRange(hsv, lo, hi))
+                counts[color] = (counts[color] || 0) + 1;
+            }
+          }
+        }
+        let best = null,
+          bestCount = 0;
+        for (let c in counts) {
+          if (counts[c] > bestCount) {
+            best = c;
+            bestCount = counts[c];
+          }
+        }
+        if (bestCount > 0.1 * BOX_SIZE * BOX_SIZE) return best;
+        return null;
+      }
+
+      function updatePlot() {
+        if (!window.chart) {
+          window.chart = new Chart(document.getElementById("plot"), {
+            type: "line",
+            data: {
+              labels: [],
+              datasets: [{ label: "Voltage", data: [], borderColor: "yellow" }],
+            },
+            options: { animation: false, scales: { y: { min: 0, max: 700 } } },
+          });
+        }
+        let sig = [];
+        for (let v of voltages) sig.push(...Array(SAMPLES_PER_BLOCK).fill(v));
+        window.chart.data.labels = sig.map((_, i) => i);
+        window.chart.data.datasets[0].data = sig;
+        window.chart.update();
+      }
+
+      function reconstructSeq() {
+        if (voltages.length === 0) return "";
+        let predKmers = voltages.map((v) => valToKmer[v]);
+        let seq = predKmers[0];
+        for (let k of predKmers.slice(1)) seq += k.slice(-1);
+        return seq;
+      }
+
+      function captureKmer(kmer) {
+        let v = kmerDict[kmer];
+        if (!kmers.length || kmers[kmers.length - 1] !== kmer) {
+          kmers.push(kmer);
+          voltages.push(v);
+          document.getElementById("log").textContent =
+            "Captured: " +
+            kmer +
+            " → " +
+            v +
+            "\nKmrs: " +
+            kmers.join(", ") +
+            "\nVoltages: " +
+            voltages.join(", ");
+          updatePlot();
+          document.getElementById("sequence").textContent =
+            "Sequence: " + reconstructSeq();
+        }
+      }
+
+      function process() {
+        let video = document.getElementById("video");
+        let canvas = document.getElementById("canvas");
+        let ctx = canvas.getContext("2d");
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        let img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+        // average brightness check
+        let sum = 0,
+          count = 0;
+        for (let i = 0; i < img.data.length; i += 4) {
+          let v = Math.max(img.data[i], img.data[i + 1], img.data[i + 2]);
+          sum += v;
+          count++;
+        }
+        let avgBrightness = sum / count;
+        if (!systemReady && avgBrightness > 30) {
+          systemReady = true;
+          document.getElementById("status").textContent =
+            "✅ Camera ready, waiting for adapter...";
+          document
+            .getElementById("status")
+            .classList.replace("text-warning", "text-success");
+        }
+
+        let cy = Math.floor(canvas.height / 2);
+        let positions = [
+          Math.floor(canvas.width / 4),
+          Math.floor(canvas.width / 2),
+          Math.floor((3 * canvas.width) / 4),
+        ];
+        let detectedBases = [];
+        for (let cx of positions) {
+          let x1 = cx - BOX_SIZE / 2,
+            y1 = cy - BOX_SIZE / 2;
+          ctx.strokeStyle = "red";
+          ctx.strokeRect(x1, y1, BOX_SIZE, BOX_SIZE);
+          let color = detectColor(
+            img.data,
+            canvas.width,
+            canvas.height,
+            x1,
+            y1
+          );
+          if (color) {
+            ctx.fillStyle = "white";
+            ctx.fillText(color, x1, y1 + BOX_SIZE + 15);
+          }
+          detectedBases.push(color ? colorToBase[color] : "-");
+        }
+
+        let codes = detectedBases.map((b) => baseToCode[b] || "-").join("");
+        document.getElementById("liveBases").textContent =
+          codes + (recording ? " [RECORDING]" : " [WAITING FOR BLACK]");
+
+        if (!recording && systemReady) {
+          let midPos = positions[1];
+          let color = detectColor(
+            img.data,
+            canvas.width,
+            canvas.height,
+            midPos - BOX_SIZE / 2,
+            cy - BOX_SIZE / 2
+          );
+          if (color === "black") {
+            recording = true;
+            kmers = [];
+            voltages = [];
+            lastDetected = null;
+            stableSince = null;
+            document.getElementById("status").textContent =
+              "▶️ Adapter detected, recording...";
+          }
+        } else if (recording) {
+          if (detectedBases.every((b) => ["A", "C", "T", "G"].includes(b))) {
+            let kmer = detectedBases.join("");
+            let now = performance.now();
+            if (kmer === lastDetected) {
+              if (stableSince && now - stableSince >= SETTLE_MS) {
+                captureKmer(kmer);
+                stableSince = null;
+              }
+            } else {
+              lastDetected = kmer;
+              stableSince = now;
+            }
+          } else {
+            lastDetected = null;
+            stableSince = null;
+          }
+        }
+        requestAnimationFrame(process);
+      }
+
+      async function populateCameras() {
+        let devices = await navigator.mediaDevices.enumerateDevices();
+        let videoDevices = devices.filter((d) => d.kind === "videoinput");
+        let sel = document.getElementById("cameraSelect");
+        sel.innerHTML = "";
+        videoDevices.forEach((d, i) => {
+          let opt = document.createElement("option");
+          opt.value = d.deviceId;
+          opt.text = d.label || `Camera ${i + 1}`;
+          sel.appendChild(opt);
+        });
+      }
+      async function startCamera() {
+        let deviceId = document.getElementById("cameraSelect").value;
+        let stream = await navigator.mediaDevices.getUserMedia({
+          video: { deviceId: deviceId ? { exact: deviceId } : undefined },
+        });
+        document.getElementById("video").srcObject = stream;
+        process();
+      }
+
+      loadLookupEmbedded();
+      populateCameras();
+      document.getElementById("startBtn").onclick = startCamera;
+    </script>
+  </body>
+</html>
