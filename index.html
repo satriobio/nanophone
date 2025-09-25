@@ -36,6 +36,10 @@
         <span id="status" class="status text-warning"
           >⏳ Waiting for camera...</span
         >
+
+        <label for="boxSpacing">Box spacing (% of width):</label>
+        <input type="range" id="boxSpacing" min="20" max="40" value="25" />
+        <span id="spacingVal">25%</span>
       </div>
     </div>
 
@@ -151,25 +155,30 @@
       const colorToBase = { red: "A", blue: "C", yellow: "T", green: "G" };
       const baseToCode = { A: "R", C: "B", T: "Y", G: "G" };
       const colorRanges = {
-        red: [
-          [0, 120, 70],
+        // Red wraps around hue edges → split into two ranges
+        red1: [
+          [0, 70, 50], // hue low, sat min, val min
           [10, 255, 255],
         ],
+        red2: [
+          [170, 70, 50],
+          [180, 255, 255],
+        ],
         green: [
-          [40, 40, 40],
-          [70, 255, 255],
+          [35, 50, 50],
+          [85, 255, 255],
         ],
         blue: [
-          [100, 150, 0],
+          [90, 50, 50],
           [140, 255, 255],
         ],
         yellow: [
-          [20, 100, 100],
-          [30, 255, 255],
+          [15, 70, 70],
+          [35, 255, 255],
         ],
         black: [
           [0, 0, 0],
-          [180, 255, 50],
+          [180, 255, 40],
         ],
       };
 
@@ -230,8 +239,10 @@
               b = pixels[idx + 2];
             let hsv = rgb2hsv(r, g, b);
             for (let [color, [lo, hi]] of Object.entries(colorRanges)) {
-              if (inRange(hsv, lo, hi))
-                counts[color] = (counts[color] || 0) + 1;
+              if (inRange(hsv, lo, hi)) {
+                let cname = color.startsWith("red") ? "red" : color;
+                counts[cname] = (counts[cname] || 0) + 1;
+              }
             }
           }
         }
@@ -243,7 +254,8 @@
             bestCount = counts[c];
           }
         }
-        if (bestCount > 0.1 * BOX_SIZE * BOX_SIZE) return best;
+        // Lower threshold to ~5% area for sensitivity
+        if (bestCount > 0.05 * BOX_SIZE * BOX_SIZE) return best;
         return null;
       }
 
@@ -293,10 +305,32 @@
         }
       }
 
+      function getPositions(width) {
+        let spacingPct = +document.getElementById("boxSpacing").value / 100;
+        let margin = (1 - 2 * spacingPct) / 2;
+        return [
+          Math.floor(width * margin),
+          Math.floor(width * 0.5),
+          Math.floor(width * (1 - margin)),
+        ];
+      }
+
+      document.getElementById("boxSpacing").oninput = (e) => {
+        document.getElementById("spacingVal").textContent =
+          e.target.value + "%";
+      };
+
       function process() {
         let video = document.getElementById("video");
         let canvas = document.getElementById("canvas");
         let ctx = canvas.getContext("2d");
+
+        // Adjust canvas to video stream size/aspect ratio
+        if (video.videoWidth && video.videoHeight) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+        }
+
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         let img = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
@@ -319,11 +353,7 @@
         }
 
         let cy = Math.floor(canvas.height / 2);
-        let positions = [
-          Math.floor(canvas.width / 4),
-          Math.floor(canvas.width / 2),
-          Math.floor((3 * canvas.width) / 4),
-        ];
+        let positions = getPositions(canvas.width);
         let detectedBases = [];
         for (let cx of positions) {
           let x1 = cx - BOX_SIZE / 2,
